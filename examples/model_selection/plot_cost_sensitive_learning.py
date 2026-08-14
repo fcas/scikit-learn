@@ -4,10 +4,10 @@ Post-tuning the decision threshold for cost-sensitive learning
 ==============================================================
 
 Once a classifier is trained, the output of the :term:`predict` method outputs class
-label predictions corresponding to a thresholding of either the :term:`decision
-function` or the :term:`predict_proba` output. For a binary classifier, the default
-threshold is defined as a posterior probability estimate of 0.5 or a decision score of
-0.0.
+label predictions corresponding to a thresholding of either the
+:term:`decision_function` or the :term:`predict_proba` output. For a binary classifier,
+the default threshold is defined as a posterior probability estimate of 0.5 or a
+decision score of 0.0.
 
 However, this default strategy is most likely not optimal for the task at hand.
 Here, we use the "Statlog" German credit dataset [1]_ to illustrate a use case.
@@ -23,17 +23,20 @@ cost.
 In the second part of the example, we further extend this approach by
 considering the problem of fraud detection in credit card transactions: in this
 case, the business metric depends on the amount of each individual transaction.
-.. topic:: References
 
-    .. [1] "Statlog (German Credit Data) Data Set", UCI Machine Learning Repository,
-       `Link
-       <https://archive.ics.uci.edu/ml/datasets/Statlog+%28German+Credit+Data%29>`_.
+.. rubric :: References
 
-    .. [2] `Charles Elkan, "The Foundations of Cost-Sensitive Learning",
-       International joint conference on artificial intelligence.
-       Vol. 17. No. 1. Lawrence Erlbaum Associates Ltd, 2001.
-       <https://cseweb.ucsd.edu/~elkan/rescale.pdf>`_
+.. [1] "Statlog (German Credit Data) Data Set", UCI Machine Learning Repository,
+    `Link <https://archive.ics.uci.edu/ml/datasets/Statlog+%28German+Credit+Data%29>`_.
+
+.. [2] `Charles Elkan, "The Foundations of Cost-Sensitive Learning",
+    International joint conference on artificial intelligence.
+    Vol. 17. No. 1. Lawrence Erlbaum Associates Ltd, 2001.
+    <https://cseweb.ucsd.edu/~elkan/rescale.pdf>`_
 """
+
+# Authors: The scikit-learn developers
+# SPDX-License-Identifier: BSD-3-Clause
 
 # %%
 # Cost-sensitive learning with constant gains and costs
@@ -134,35 +137,36 @@ scoring = {
 # predictions (correct or wrong) might impact the business value of deploying a
 # given machine learning model in a specific application context. For our
 # credit prediction task, the authors provide a custom cost-matrix which
-# encodes that classifying a a "bad" credit as "good" is 5 times more costly on
+# encodes that classifying a "bad" credit as "good" is 5 times more costly on
 # average than the opposite: it is less costly for the financing institution to
 # not grant a credit to a potential customer that will not default (and
 # therefore miss a good customer that would have otherwise both reimbursed the
-# credit and payed interests) than to grant a credit to a customer that will
+# credit and paid interests) than to grant a credit to a customer that will
 # default.
 #
-# We define a python function that weight the confusion matrix and return the
+# We define a python function that weighs the confusion matrix and returns the
 # overall cost.
+# The rows of the confusion matrix hold the counts of observed classes
+# while the columns hold counts of predicted classes. Recall that here we
+# consider "bad" as the positive class (second row and column).
+# Scikit-learn model selection tools expect that we follow a convention
+# that "higher" means "better", hence the following gain matrix assigns
+# negative gains (costs) to the two kinds of prediction errors:
+#
+# - a gain of `-1` for each false positive ("good" credit labeled as "bad"),
+# - a gain of `-5` for each false negative ("bad" credit labeled as "good"),
+# - a `0` gain for true positives and true negatives.
+#
+# Note that theoretically, given that our model is calibrated, our dataset
+# is representative and large enough, we do not need to tune the
+# threshold, but can safely set it to 1/5 of the cost ratio, as stated by
+# Eq. (2) in Elkan's paper [2]_.
 import numpy as np
 
 
 def credit_gain_score(y, y_pred, neg_label, pos_label):
     cm = confusion_matrix(y, y_pred, labels=[neg_label, pos_label])
-    # The rows of the confusion matrix hold the counts of observed classes
-    # while the columns hold counts of predicted classes. Recall that here we
-    # consider "bad" as the positive class (second row and column).
-    # Scikit-learn model selection tools expect that we follow a convention
-    # that "higher" means "better", hence the following gain matrix assigns
-    # negative gains (costs) to the two kinds of prediction errors:
-    # - a gain of -1 for each false positive ("good" credit labeled as "bad"),
-    # - a gain of -5 for each false negative ("bad" credit labeled as "good"),
-    # The true positives and true negatives are assigned null gains in this
-    # metric.
-    #
-    # Note that theoretically, given that our model is calibrated and our data
-    # set representative and large enough, we do not need to tune the
-    # threshold, but can safely set it to the cost ration 1/5, as stated by Eq.
-    # (2) in Elkan paper [2]_.
+
     gain_matrix = np.array(
         [
             [0, -1],  # -1 gain for false positives
@@ -172,7 +176,7 @@ def credit_gain_score(y, y_pred, neg_label, pos_label):
     return np.sum(cm * gain_matrix)
 
 
-scoring["cost_gain"] = make_scorer(
+scoring["credit_gain"] = make_scorer(
     credit_gain_score, neg_label=neg_label, pos_label=pos_label
 )
 # %%
@@ -247,7 +251,7 @@ _ = fig.suptitle("Evaluation of the vanilla GBDT model")
 # However, we recall that the original aim was to minimize the cost (or maximize the
 # gain) as defined by the business metric. We can compute the value of the business
 # metric:
-print(f"Business defined metric: {scoring['cost_gain'](model, X_test, y_test)}")
+print(f"Business defined metric: {scoring['credit_gain'](model, X_test, y_test)}")
 
 # %%
 # At this stage we don't know if any other cut-off can lead to a greater gain. To find
@@ -272,7 +276,7 @@ from sklearn.model_selection import TunedThresholdClassifierCV
 
 tuned_model = TunedThresholdClassifierCV(
     estimator=model,
-    scoring=scoring["cost_gain"],
+    scoring=scoring["credit_gain"],
     store_cv_results=True,  # necessary to inspect all results
 )
 tuned_model.fit(X_train, y_train)
@@ -300,10 +304,9 @@ def plot_roc_pr_curves(vanilla_model, tuned_model, *, title):
             X_test,
             y_test,
             pos_label=pos_label,
-            linestyle=linestyle,
-            color=color,
             ax=axs[0],
             name=name,
+            curve_kwargs={"linestyle": linestyle, "color": color},
         )
         axs[0].plot(
             scoring["recall"](est, X_test, y_test),
@@ -318,8 +321,7 @@ def plot_roc_pr_curves(vanilla_model, tuned_model, *, title):
             X_test,
             y_test,
             pos_label=pos_label,
-            linestyle=linestyle,
-            color=color,
+            curve_kwargs={"linestyle": linestyle, "color": color},
             ax=axs[1],
             name=name,
             plot_chance_level=idx == 1,
@@ -370,20 +372,20 @@ plot_roc_pr_curves(model, tuned_model, title=title)
 #
 # The second remark is that the cut-off points of the vanilla and tuned model are
 # different. To understand why the tuned model has chosen this cut-off point, we can
-# look at the right-hand side plot that plots the objective score that is our exactly
+# look at the right-hand side plot that plots the objective score that is exactly
 # the same as our business metric. We see that the optimum threshold corresponds to the
 # maximum of the objective score. This maximum is reached for a decision threshold
 # much lower than 0.5: the tuned model enjoys a much higher recall at the cost of
-# of significantly lower precision: the tuned model is much more eager to
-# predict the "bad" class label to larger fraction of individuals.
+# significantly lower precision: the tuned model is much more eager to
+# predict the "bad" class label for a larger fraction of individuals.
 #
 # We can now check if choosing this cut-off point leads to a better score on the testing
 # set:
-print(f"Business defined metric: {scoring['cost_gain'](tuned_model, X_test, y_test)}")
+print(f"Business defined metric: {scoring['credit_gain'](tuned_model, X_test, y_test)}")
 
 # %%
-# We observe that tuning the decision threshold almost improves our business gains
-# by factor of 2.
+# We observe that tuning the decision threshold improves our business gains
+# by almost a factor of 2.
 #
 # .. _TunedThresholdClassifierCV_no_cv:
 #
@@ -399,8 +401,8 @@ print(f"Business defined metric: {scoring['cost_gain'](tuned_model, X_test, y_te
 # These two strategies can be changed by providing the `refit` and `cv` parameters.
 # For instance, one could provide a fitted `estimator` and set `cv="prefit"`, in which
 # case the cut-off point is found on the entire dataset provided at fitting time.
-# Also, the underlying classifier is not be refitted by setting `refit=False`. Here, we
-# can try to do such experiment.
+# This also requires to set `refit=False`, so that the underlying classifier will not be
+# refitted. Here, we can try to do such an experiment:
 model.fit(X_train, y_train)
 tuned_model.set_params(cv="prefit", refit=False).fit(X_train, y_train)
 print(f"{tuned_model.best_threshold_=:0.2f}")
@@ -412,29 +414,31 @@ title = "Tuned GBDT model without refitting and using the entire dataset"
 plot_roc_pr_curves(model, tuned_model, title=title)
 
 # %%
-# We observe the that the optimum cut-off point is different from the one found
+# We observe that the optimum cut-off point is different from the one found
 # in the previous experiment. If we look at the right-hand side plot, we
-# observe that the business gain has large plateau of near-optimal 0 gain for a
-# large span of decision thresholds. This behavior is symptomatic of an
-# overfitting. Because we disable cross-validation, we tuned the cut-off point
+# can see that the business gain has a large plateau of near-optimal 0 gain for a
+# large span of decision thresholds. This behavior is symptomatic of
+# overfitting. Because we disabled cross-validation, we tuned the cut-off point
 # on the same set as the model was trained on, and this is the reason for the
 # observed overfitting.
 #
 # This option should therefore be used with caution. One needs to make sure that the
 # data provided at fitting time to the
 # :class:`~sklearn.model_selection.TunedThresholdClassifierCV` is not the same as the
-# data used to train the underlying classifier. This could happen sometimes when the
+# data used to train the underlying classifier. This can be the case when the
 # idea is just to tune the predictive model on a completely new validation set without a
 # costly complete refit.
 #
 # When cross-validation is too costly, a potential alternative is to use a
 # single train-test split by providing a floating number in range `[0, 1]` to the `cv`
-# parameter. It splits the data into a training and testing set. Let's explore this
-# option:
+# parameter. It splits the data into a training and testing set. (Note that
+# `refit=False` is still set, which means the model will not be refitted on the entire
+# training set once the threshold has been found.)
+# Let's explore this option:
 tuned_model.set_params(cv=0.75).fit(X_train, y_train)
 
 # %%
-title = "Tuned GBDT model without refitting and using the entire dataset"
+title = "Tuned GBDT model using a single train-test split"
 plot_roc_pr_curves(model, tuned_model, title=title)
 
 # %%
@@ -465,8 +469,7 @@ credit_card.frame.info()
 # The dataset contains information about credit card records from which some are
 # fraudulent and others are legitimate. The goal is therefore to predict whether or
 # not a credit card record is fraudulent.
-columns_to_drop = ["Class"]
-data = credit_card.frame.drop(columns=columns_to_drop)
+data = credit_card.frame.drop(columns=["Class"])
 target = credit_card.frame["Class"].astype(int)
 
 # %%
@@ -486,24 +489,23 @@ target.value_counts()
 # fraudulent transactions.
 fraud = target == 1
 amount_fraud = data["Amount"][fraud]
-_, ax = plt.subplots()
-ax.hist(amount_fraud, bins=100)
-ax.set_title("Amount of fraud transaction")
-_ = ax.set_xlabel("Amount (€)")
+_ = amount_fraud.plot.hist(
+    bins=30, title="Amount of fraud transaction", xlabel="Amount (€)"
+)
 
 # %%
 # Addressing the problem with a business metric
 # ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 #
-# Now, we create the business metric that depends on the amount of each transaction. We
+# Now, we create a business metric that depends on the amount of each transaction. We
 # define the cost matrix similarly to [2]_. Accepting a legitimate transaction provides
 # a gain of 2% of the amount of the transaction. However, accepting a fraudulent
-# transaction result in a loss of the amount of the transaction. As stated in [2]_, the
+# transaction results in a loss of the amount of the transaction. As stated in [2]_, the
 # gain and loss related to refusals (of fraudulent and legitimate transactions) are not
-# trivial to define. Here, we define that a refusal of a legitimate transaction is
-# estimated to a loss of 5€ while the refusal of a fraudulent transaction is estimated
-# to a gain of 50€ and the amount of the transaction. Therefore, we define the
-# following function to compute the total benefit of a given decision:
+# trivial to define. Here, we define that a refusal of a legitimate transaction
+# is estimated to a loss of 5€ while the refusal of a fraudulent transaction is
+# estimated to a gain of 50€. Therefore, we define the following function to
+# compute the total benefit of a given decision:
 
 
 def business_metric(y_true, y_pred, amount):
@@ -511,9 +513,7 @@ def business_metric(y_true, y_pred, amount):
     mask_true_negative = (y_true == 0) & (y_pred == 0)
     mask_false_positive = (y_true == 0) & (y_pred == 1)
     mask_false_negative = (y_true == 1) & (y_pred == 0)
-    fraudulent_refuse = (mask_true_positive.sum() * 50) + amount[
-        mask_true_positive
-    ].sum()
+    fraudulent_refuse = mask_true_positive.sum() * 50
     fraudulent_accept = -amount[mask_false_negative].sum()
     legitimate_refuse = mask_false_positive.sum() * -5
     legitimate_accept = (amount[mask_true_negative] * 0.02).sum()
@@ -521,17 +521,17 @@ def business_metric(y_true, y_pred, amount):
 
 
 # %%
-# From this business metric, we create a scikit-learn scorer that given a fitted
-# classifier and a test set compute the business metric. In this regard, we use
-# the :func:`~sklearn.metrics.make_scorer` factory. The variable `amount` is an
-# additional metadata to be passed to the scorer and we need to use
-# :ref:`metadata routing <metadata_routing>` to take into account this information.
+# From this business metric, we create a scikit-learn scorer that, given a fitted
+# classifier and a test set, computes the business metric. We use the
+# :func:`~sklearn.metrics.make_scorer` factory again here. The variable `amount` is an
+# additional metadata to be passed to the scorer and we need to use :ref:`metadata
+# routing <metadata_routing>` to take this information into account.
 sklearn.set_config(enable_metadata_routing=True)
 business_scorer = make_scorer(business_metric).set_score_request(amount=True)
 
 # %%
 # So at this stage, we observe that the amount of the transaction is used twice: once
-# as a feature to train our predictive model and once as a metadata to compute the
+# as a feature to train our predictive model and once as metadata to compute the
 # the business metric and thus the statistical performance of our model. When used as a
 # feature, we are only required to have a column in `data` that contains the amount of
 # each transaction. To use this information as metadata, we need to have an external
@@ -540,7 +540,6 @@ business_scorer = make_scorer(business_metric).set_score_request(amount=True)
 amount = credit_card.frame["Amount"].to_numpy()
 
 # %%
-# We first start to train a dummy classifier to have some baseline results.
 from sklearn.model_selection import train_test_split
 
 data_train, data_test, target_train, target_test, amount_train, amount_test = (
@@ -550,50 +549,44 @@ data_train, data_test, target_train, target_test, amount_train, amount_test = (
 )
 
 # %%
+# We first evaluate some baseline policies to serve as reference. Recall that
+# class "0" is the legitimate class and class "1" is the fraudulent class.
 from sklearn.dummy import DummyClassifier
 
-easy_going_classifier = DummyClassifier(strategy="constant", constant=0)
-easy_going_classifier.fit(data_train, target_train)
-benefit_cost = business_scorer(
-    easy_going_classifier, data_test, target_test, amount=amount_test
+always_accept_policy = DummyClassifier(strategy="constant", constant=0)
+always_accept_policy.fit(data_train, target_train)
+benefit = business_scorer(
+    always_accept_policy, data_test, target_test, amount=amount_test
 )
-print(f"Benefit/cost of our easy-going classifier: {benefit_cost:,.2f}€")
+print(f"Benefit of the 'always accept' policy: {benefit:,.2f}€")
 
 # %%
-# A classifier that predict all transactions as legitimate would create a profit of
-# around 220,000.€ We make the same evaluation for a classifier that predicts all
+# A policy that considers all transactions as legitimate would create a profit of
+# around 220,000€. We make the same evaluation for a classifier that predicts all
 # transactions as fraudulent.
-intolerant_classifier = DummyClassifier(strategy="constant", constant=1)
-intolerant_classifier.fit(data_train, target_train)
-benefit_cost = business_scorer(
-    intolerant_classifier, data_test, target_test, amount=amount_test
+always_reject_policy = DummyClassifier(strategy="constant", constant=1)
+always_reject_policy.fit(data_train, target_train)
+benefit = business_scorer(
+    always_reject_policy, data_test, target_test, amount=amount_test
 )
-print(f"Benefit/cost of our intolerant classifier: {benefit_cost:,.2f}€")
+print(f"Benefit of the 'always reject' policy: {benefit:,.2f}€")
+
 
 # %%
-# Such a classifier create a loss of around 670,000.€ A predictive model should allow
-# us to make a profit larger than 220,000.€ It is interesting to compare this business
-# metric with another "standard" statistical metric such as the balanced accuracy.
-from sklearn.metrics import get_scorer
-
-balanced_accuracy_scorer = get_scorer("balanced_accuracy")
-print(
-    "Balanced accuracy of our easy-going classifier: "
-    f"{balanced_accuracy_scorer(easy_going_classifier, data_test, target_test):.3f}"
-)
-print(
-    "Balanced accuracy of our intolerant classifier: "
-    f"{balanced_accuracy_scorer(intolerant_classifier, data_test, target_test):.3f}"
-)
-
-# %%
-# This is not a surprise that the balanced accuracy is at 0.5 for both classifiers.
-# However, we need to be careful in the rest of the evaluation: we potentially can
-# obtain a model with a decent balanced accuracy that does not make any profit.
-# In this case, the model would be harmful for our business.
+# Such a policy would entail a catastrophic loss: almost 700,000€. This is
+# expected since the vast majority of the transactions are legitimate and the
+# policy would refuse them at a non-trivial cost.
 #
-# Let's now create a predictive model using a logistic regression without tuning the
-# decision threshold.
+# A predictive model that adapts the accept/reject decisions on a per
+# transaction basis should ideally allow us to make a profit larger than the
+# 220,000€ of the best of our constant baseline policies.
+#
+# We start with a logistic regression model with the default decision threshold
+# at 0.5. Here we tune the hyperparameter `C` of the logistic regression with a
+# proper scoring rule (the log loss) to ensure that the model's probabilistic
+# predictions returned by its `predict_proba` method are as accurate as
+# possible, irrespectively of the choice of the value of the decision
+# threshold.
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import GridSearchCV
 from sklearn.pipeline import make_pipeline
@@ -604,26 +597,24 @@ param_grid = {"logisticregression__C": np.logspace(-6, 6, 13)}
 model = GridSearchCV(logistic_regression, param_grid, scoring="neg_log_loss").fit(
     data_train, target_train
 )
+model
 
+# %%
 print(
-    "Benefit/cost of our logistic regression: "
+    "Benefit of logistic regression with default threshold: "
     f"{business_scorer(model, data_test, target_test, amount=amount_test):,.2f}€"
-)
-print(
-    "Balanced accuracy of our logistic regression: "
-    f"{balanced_accuracy_scorer(model, data_test, target_test):.3f}"
 )
 
 # %%
-# By observing the balanced accuracy, we see that our predictive model is learning
-# some associations between the features and the target. The business metric also shows
-# that our model is beating the baseline in terms of profit and it would be already
-# beneficial to use it instead of ignoring the fraud detection problem.
+# The business metric shows that our predictive model with a default decision
+# threshold is already winning over the baseline in terms of profit and it would be
+# already beneficial to use it to accept or reject transactions instead of
+# accepting all transactions.
 #
 # Tuning the decision threshold
 # ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 #
-# Now the question is: is our model optimum for the type of decision that we want to do?
+# Now the question is: is our model optimal for the type of decision that we want to do?
 # Up to now, we did not optimize the decision threshold. We use the
 # :class:`~sklearn.model_selection.TunedThresholdClassifierCV` to optimize the decision
 # given our business scorer. To avoid a nested cross-validation, we will use the
@@ -643,29 +634,20 @@ tuned_model = TunedThresholdClassifierCV(
 tuned_model.fit(data_train, target_train, amount=amount_train)
 
 # %%
+# We observe that the tuned decision threshold is far away from the default 0.5:
+print(f"Tuned decision threshold: {tuned_model.best_threshold_:.2f}")
+
+# %%
 print(
-    "Benefit/cost of our logistic regression: "
+    "Benefit of logistic regression with a tuned threshold: "
     f"{business_scorer(tuned_model, data_test, target_test, amount=amount_test):,.2f}€"
-)
-print(
-    "Balanced accuracy of our logistic regression: "
-    f"{balanced_accuracy_scorer(tuned_model, data_test, target_test):.3f}"
 )
 
 # %%
-# We observe that tuning the decision threshold increases the expected profit of
-# deploying our model as estimated by the business metric.
-# Eventually, the balanced accuracy also increased. Note that it might not always be
-# the case because the statistical metric is not necessarily a surrogate of the
-# business metric. It is therefore important, whenever possible, optimize the decision
-# threshold with respect to the business metric.
-#
-# Finally, the estimate of the business metric itself can be unreliable, in
-# particular when the number of data points in the minority class is so small.
-# Any business impact estimated by cross-validation of a business metric on
-# historical data (offline evaluation) should ideally be confirmed by A/B testing
-# on live data (online evaluation). Note however that A/B testing models is
-# beyond the scope of the scikit-learn library itself.
+# We observe that tuning the decision threshold increases the expected profit
+# when deploying our model - as indicated by the business metric. It is therefore
+# valuable, whenever possible, to optimize the decision threshold with respect
+# to the business metric.
 #
 # Manually setting the decision threshold instead of tuning it
 # ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -677,26 +659,35 @@ print(
 #
 # The class :class:`~sklearn.model_selection.FixedThresholdClassifier` allows us to
 # manually set the decision threshold. At prediction time, it behave as the previous
-# tuned model but no search is performed during the fitting process.
+# tuned model but no search is performed during the fitting process. Note that here
+# we use :class:`~sklearn.frozen.FrozenEstimator` to wrap the predictive model to
+# avoid any refitting.
 #
 # Here, we will reuse the decision threshold found in the previous section to create a
 # new model and check that it gives the same results.
+from sklearn.frozen import FrozenEstimator
 from sklearn.model_selection import FixedThresholdClassifier
 
 model_fixed_threshold = FixedThresholdClassifier(
-    estimator=model, threshold=tuned_model.best_threshold_
-).fit(data_train, target_train)
+    estimator=FrozenEstimator(model), threshold=tuned_model.best_threshold_
+)
 
 # %%
 business_score = business_scorer(
     model_fixed_threshold, data_test, target_test, amount=amount_test
 )
-print(f"Benefit/cost of our logistic regression: {business_score:,.2f}€")
-print(
-    "Balanced accuracy of our logistic regression: "
-    f"{balanced_accuracy_scorer(model_fixed_threshold, data_test, target_test):.3f}"
-)
+print(f"Benefit of logistic regression with a tuned threshold:  {business_score:,.2f}€")
 
 # %%
-# We observe that we obtained the exact same results but the fitting process was much
-# faster since we did not perform any search.
+# We observe that we obtained the exact same results but the fitting process
+# was much faster since we did not perform any hyper-parameter search.
+#
+# Finally, the estimate of the (average) business metric itself can be unreliable, in
+# particular when the number of data points in the minority class is very small.
+# Any business impact estimated by cross-validation of a business metric on
+# historical data (offline evaluation) should ideally be confirmed by A/B testing
+# on live data (online evaluation). Note however that A/B testing models is
+# beyond the scope of the scikit-learn library itself.
+#
+# At the end, we disable the configuration flag for metadata routing:
+sklearn.set_config(enable_metadata_routing=False)

@@ -15,10 +15,8 @@ The visualization shows coefficients of the models for varying C.
 
 """
 
-# Authors: Alexandre Gramfort <alexandre.gramfort@inria.fr>
-#          Mathieu Blondel <mathieu@mblondel.org>
-#          Andreas Mueller <amueller@ais.uni-bonn.de>
-# License: BSD 3 clause
+# Authors: The scikit-learn developers
+# SPDX-License-Identifier: BSD-3-Clause
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -41,11 +39,9 @@ fig, axes = plt.subplots(3, 3)
 # Set regularization parameter
 for i, (C, axes_row) in enumerate(zip((1, 0.1, 0.01), axes)):
     # Increase tolerance for short training time
-    clf_l1_LR = LogisticRegression(C=C, penalty="l1", tol=0.01, solver="saga")
-    clf_l2_LR = LogisticRegression(C=C, penalty="l2", tol=0.01, solver="saga")
-    clf_en_LR = LogisticRegression(
-        C=C, penalty="elasticnet", solver="saga", l1_ratio=l1_ratio, tol=0.01
-    )
+    clf_l1_LR = LogisticRegression(C=C, l1_ratio=1, tol=0.01, solver="saga")
+    clf_l2_LR = LogisticRegression(C=C, l1_ratio=0, tol=0.01, solver="saga")
+    clf_en_LR = LogisticRegression(C=C, l1_ratio=l1_ratio, tol=0.01, solver="saga")
     clf_l1_LR.fit(X, y)
     clf_l2_LR.fit(X, y)
     clf_en_LR.fit(X, y)

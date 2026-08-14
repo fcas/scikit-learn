@@ -5,10 +5,10 @@ from sklearn.utils._testing import assert_allclose
 from sklearn.utils.arrayfuncs import _all_with_any_reduction_axis_1, min_pos
 
 
-def test_min_pos():
+def test_min_pos(global_random_seed):
     # Check that min_pos returns a positive value and that it's consistent
     # between float and double
-    X = np.random.RandomState(0).randn(100)
+    X = np.random.RandomState(global_random_seed).randn(100)
 
     min_double = min_pos(X)
     min_float = min_pos(X.astype(np.float32))
@@ -26,7 +26,9 @@ def test_min_pos_no_positive(dtype):
     assert min_pos(X) == np.finfo(dtype).max
 
 
-@pytest.mark.parametrize("dtype", [np.int16, np.int32, np.float32, np.float64])
+@pytest.mark.parametrize(
+    "dtype", [np.int16, np.int32, np.int64, np.float32, np.float64]
+)
 @pytest.mark.parametrize("value", [0, 1.5, -1])
 def test_all_with_any_reduction_axis_1(dtype, value):
     # Check that return value is False when there is no row equal to `value`

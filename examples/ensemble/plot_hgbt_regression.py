@@ -26,8 +26,8 @@ This example aims at showcasing all points except 2 and 6 in a real life
 setting.
 """
 
-# Author: Arturo Amor <david-arturo.amor-quiroz@inria.fr>
-# License: BSD 3 clause
+# Authors: The scikit-learn developers
+# SPDX-License-Identifier: BSD-3-Clause
 
 # %%
 # Preparing the data
@@ -42,11 +42,12 @@ setting.
 # May 1996 to 5 December 1998. Each sample of the dataset refers to a period of
 # 30 minutes, i.e. there are 48 instances for each time period of one day. Each
 # sample on the dataset has 7 columns:
-#   - date: between 7 May 1996 to 5 December 1998. Normalized between 0 and 1;
-#   - day: day of week (1-7);
-#   - period: half hour intervals over 24 hours. Normalized between 0 and 1;
-#   - nswprice/nswdemand: electricity price/demand of New South Wales;
-#   - vicprice/vicdemand: electricity price/demand of Victoria.
+#
+# - date: between 7 May 1996 to 5 December 1998. Normalized between 0 and 1;
+# - day: day of week (1-7);
+# - period: half hour intervals over 24 hours. Normalized between 0 and 1;
+# - nswprice/nswdemand: electricity price/demand of New South Wales;
+# - vicprice/vicdemand: electricity price/demand of Victoria.
 #
 # Originally, it is a classification task, but here we use it for the regression
 # task to predict the scheduled electricity transfer between states.
@@ -77,7 +78,7 @@ y = df["transfer"]
 
 fig, ax = plt.subplots(figsize=(15, 10))
 pointplot = sns.lineplot(x=df["period"], y=df["transfer"], hue=df["day"], ax=ax)
-handles, lables = ax.get_legend_handles_labels()
+handles, labels = ax.get_legend_handles_labels()
 ax.set(
     title="Hourly energy transfer for different days of the week",
     xlabel="Normalized time of the day",
@@ -308,7 +309,7 @@ ax.set(
 _ = ax.legend(loc="lower right")
 
 # %%
-# We observe a tendence to over-estimate the energy transfer. This could be be
+# We observe a tendency to over-estimate the energy transfer. This could be be
 # quantitatively confirmed by computing empirical coverage numbers as done in
 # the :ref:`calibration of confidence intervals section <calibration-section>`.
 # Keep in mind that those predicted percentiles are just estimations from a
@@ -325,7 +326,7 @@ _ = ax.legend(loc="lower right")
 #
 # Given specific domain knowledge that requires the relationship between a
 # feature and the target to be monotonically increasing or decreasing, one can
-# enforce such behaviour in the predictions of a HGBT model using monotonic
+# enforce such behaviour in the predictions of an HGBT model using monotonic
 # constraints. This makes the model more interpretable and can reduce its
 # variance (and potentially mitigate overfitting) at the risk of increasing
 # bias. Monotonic constraints can also be used to enforce specific regulatory

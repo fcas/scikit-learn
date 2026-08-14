@@ -2,10 +2,48 @@
 Loss functions for linear models with raw_prediction = X @ coef
 """
 
+# Authors: The scikit-learn developers
+# SPDX-License-Identifier: BSD-3-Clause
+
 import numpy as np
 from scipy import sparse
 
-from ..utils.extmath import squared_norm
+from sklearn.utils._array_api import (
+    _is_numpy_namespace,
+    _ravel,
+    get_namespace,
+    get_namespace_and_device,
+    move_to,
+)
+from sklearn.utils._sparse import _align_api_if_sparse
+from sklearn.utils.extmath import safe_sparse_dot, squared_norm
+
+
+def sandwich_dot(X, W):
+    """Compute the sandwich product X.T @ diag(W) @ X."""
+    # TODO: This "sandwich product" is the main computational bottleneck for solvers
+    # that use the full hessian matrix. Here, thread parallelism would pay-off the
+    # most.
+    # While a dedicated Cython routine could exploit the symmetry, it is very hard to
+    # beat BLAS GEMM, even thought the latter cannot exploit the symmetry, unless one
+    # pays the price of taking square roots and implements
+    #    sqrtWX = sqrt(W)[: None] * X
+    #    return sqrtWX.T @ sqrtWX
+    # which (might) detect the symmetry and use BLAS SYRK under the hood.
+    n_samples = X.shape[0]
+    if sparse.issparse(X):
+        return _align_api_if_sparse(
+            safe_sparse_dot(
+                X.T,
+                sparse.dia_array((W, 0), shape=(n_samples, n_samples)) @ X,
+                dense_output=True,
+            )
+        )
+    else:
+        # np.einsum may use less memory but the following, using BLAS matrix
+        # multiplication (GEMM), is by far faster.
+        WX = W[:, None] * X
+        return X.T @ WX
 
 
 class LinearModelLoss:
@@ -13,19 +51,23 @@ class LinearModelLoss:
 
     Note that raw_prediction is also known as linear predictor.
 
-    The loss is the average of per sample losses and includes a term for L2
+    The loss is the average of per sample losses and includes a term for L1 and L2
     regularization::
 
         loss = 1 / s_sum * sum_i s_i loss(y_i, X_i @ coef + intercept)
                + 1/2 * l2_reg_strength * ||coef||_2^2
+               + l1_reg_strength * ||coef||_1
 
     with sample weights s_i=1 if sample_weight=None and s_sum=sum_i s_i.
+    Note that the L1 penalty is not taken into account for gradient and hessian.
 
     Gradient and hessian, for simplicity without intercept, are::
 
         gradient = 1 / s_sum * X.T @ loss.gradient + l2_reg_strength * coef
         hessian = 1 / s_sum * X.T @ diag(loss.hessian) @ X
                   + l2_reg_strength * identity
+
+    The L1 penalty NEVER enters gradient or hessian, only loss.
 
     Conventions:
         if fit_intercept:
@@ -43,12 +85,22 @@ class LinearModelLoss:
             if coef.shape (n_classes, n_dof):
                 intercept = coef[:, -1]
             if coef.shape (n_classes * n_dof,)
-                intercept = coef[n_features::n_dof] = coef[(n_dof-1)::n_dof]
+                intercept = coef[n_classes * n_features:] = coef[(n_dof-1):]
             intercept.shape = (n_classes,)
         else:
             intercept = coef[-1]
 
-    Note: If coef has shape (n_classes * n_dof,), the 2d-array can be reconstructed as
+        Shape of gradient follows shape of coef.
+        gradient.shape = coef.shape
+
+        But hessian (to make our lives simpler) are always 2-d:
+        if base_loss.is_multiclass:
+            hessian.shape = (n_classes * n_dof, n_classes * n_dof)
+        else:
+            hessian.shape = (n_dof, n_dof)
+
+    Note: if coef has shape (n_classes * n_dof,), the classes are expected to be
+    contiguous, i.e. the 2d-array can be reconstructed as
 
         coef.reshape((n_classes, -1), order="F")
 
@@ -93,9 +145,9 @@ class LinearModelLoss:
         else:
             n_dof = n_features
         if self.base_loss.is_multiclass:
-            coef = np.zeros_like(X, shape=(n_classes, n_dof), dtype=dtype, order="F")
+            coef = np.zeros(shape=(n_classes, n_dof), dtype=dtype, order="F")
         else:
-            coef = np.zeros_like(X, shape=n_dof, dtype=dtype)
+            coef = np.zeros(shape=n_dof, dtype=dtype)
         return coef
 
     def weight_intercept(self, coef):
@@ -126,7 +178,11 @@ class LinearModelLoss:
         else:
             # reshape to (n_classes, n_dof)
             if coef.ndim == 1:
-                weights = coef.reshape((self.base_loss.n_classes, -1), order="F")
+                xp, _ = get_namespace(coef)
+                if _is_numpy_namespace(xp):
+                    weights = coef.reshape((self.base_loss.n_classes, -1), order="F")
+                else:
+                    weights = xp.reshape(coef, (-1, self.base_loss.n_classes)).T
             else:
                 weights = coef
             if self.fit_intercept:
@@ -160,19 +216,36 @@ class LinearModelLoss:
             (n_samples, n_classes)
         """
         weights, intercept = self.weight_intercept(coef)
+        xp, _, device = get_namespace_and_device(X)
 
+        # The `weights` and `intercept` are only converted internally to the
+        # array API because the relevant `scipy.optimize` functions do not
+        # currently support the array API and we have to ensure that the final
+        # values returned to the respective `scipy.optimize` function are in
+        # the `numpy` namespace.
+        weights_xp = xp.asarray(weights, dtype=X.dtype, device=device)
+        intercept_xp = xp.asarray(intercept, dtype=X.dtype, device=device)
         if not self.base_loss.is_multiclass:
-            raw_prediction = X @ weights + intercept
+            raw_prediction = X @ weights_xp + intercept_xp
         else:
             # weights has shape (n_classes, n_dof)
-            raw_prediction = X @ weights.T + intercept  # ndarray, likely C-contiguous
+            raw_prediction = X @ weights_xp.T + intercept_xp
 
         return weights, intercept, raw_prediction
 
+    def l1_penalty(self, weights, l1_reg_strength):
+        """Compute L1 penalty term: l1_reg_strength * ||w||_1."""
+        # TODO(numpy 2.0): use np.linalg.vector_norm
+        if weights.ndim == 1:
+            norm1_w = np.linalg.norm(weights, ord=1)
+        else:
+            norm1_w = np.sum(np.abs(weights))
+        return float(l1_reg_strength * norm1_w)
+
     def l2_penalty(self, weights, l2_reg_strength):
-        """Compute L2 penalty term l2_reg_strength/2 *||w||_2^2."""
+        """Compute L2 penalty term l2_reg_strength / 2 * ||w||_2^2."""
         norm2_w = weights @ weights if weights.ndim == 1 else squared_norm(weights)
-        return 0.5 * l2_reg_strength * norm2_w
+        return float(0.5 * l2_reg_strength * norm2_w)
 
     def loss(
         self,
@@ -180,6 +253,7 @@ class LinearModelLoss:
         X,
         y,
         sample_weight=None,
+        l1_reg_strength=0.0,
         l2_reg_strength=0.0,
         n_threads=1,
         raw_prediction=None,
@@ -199,6 +273,8 @@ class LinearModelLoss:
             Observed, true target values.
         sample_weight : None or contiguous array of shape (n_samples,), default=None
             Sample weights.
+        l1_reg_strength : float, default=0.0
+            L1 regularization strength
         l2_reg_strength : float, default=0.0
             L2 regularization strength
         n_threads : int, default=1
@@ -213,6 +289,7 @@ class LinearModelLoss:
         loss : float
             Weighted average of losses per sample, plus penalty.
         """
+        n_samples = X.shape[0]
         if raw_prediction is None:
             weights, intercept, raw_prediction = self.weight_intercept_raw(coef, X)
         else:
@@ -221,12 +298,18 @@ class LinearModelLoss:
         loss = self.base_loss.loss(
             y_true=y,
             raw_prediction=raw_prediction,
-            sample_weight=None,
+            sample_weight=sample_weight,
             n_threads=n_threads,
         )
-        loss = np.average(loss, weights=sample_weight)
+        xp, _ = get_namespace(X, y, sample_weight)
+        sw_sum = n_samples if sample_weight is None else xp.sum(sample_weight)
+        loss = float(xp.sum(loss) / sw_sum)
 
-        return loss + self.l2_penalty(weights, l2_reg_strength)
+        if l1_reg_strength > 0:
+            loss += self.l1_penalty(weights, l1_reg_strength)
+        if l2_reg_strength > 0:
+            loss += self.l2_penalty(weights, l2_reg_strength)
+        return loss
 
     def loss_gradient(
         self,
@@ -234,6 +317,7 @@ class LinearModelLoss:
         X,
         y,
         sample_weight=None,
+        l1_reg_strength=0.0,
         l2_reg_strength=0.0,
         n_threads=1,
         raw_prediction=None,
@@ -253,6 +337,8 @@ class LinearModelLoss:
             Observed, true target values.
         sample_weight : None or contiguous array of shape (n_samples,), default=None
             Sample weights.
+        l1_reg_strength : float, default=0.0
+            L1 regularization strength
         l2_reg_strength : float, default=0.0
             L2 regularization strength
         n_threads : int, default=1
@@ -284,34 +370,57 @@ class LinearModelLoss:
             sample_weight=sample_weight,
             n_threads=n_threads,
         )
-        sw_sum = n_samples if sample_weight is None else np.sum(sample_weight)
-        loss = loss.sum() / sw_sum
-        loss += self.l2_penalty(weights, l2_reg_strength)
+        xp, _ = get_namespace(X, y, sample_weight)
+        sw_sum = n_samples if sample_weight is None else xp.sum(sample_weight)
+        loss = float(xp.sum(loss) / sw_sum)
+        if l1_reg_strength > 0:
+            loss += self.l1_penalty(weights, l1_reg_strength)
+        if l2_reg_strength > 0:
+            loss += self.l2_penalty(weights, l2_reg_strength)
 
         grad_pointwise /= sw_sum
 
+        # TODO: The lbfgs solver currently only works with numpy arrays and expects
+        # both the coef argument and the result to be in numpy. So, for the time
+        # being, we stick with a mix of numpy and array API. We could consider
+        # moving coef to the device of X if lbgfs also becomes compatible with the
+        # array API.
         if not self.base_loss.is_multiclass:
             grad = np.empty_like(coef, dtype=weights.dtype)
-            grad[:n_features] = X.T @ grad_pointwise + l2_reg_strength * weights
+            X_grad = X.T @ grad_pointwise
+            grad[:n_features] = (
+                move_to(X_grad, xp=np, device="cpu") + l2_reg_strength * weights
+            )
             if self.fit_intercept:
-                grad[-1] = grad_pointwise.sum()
+                grad[-1] = xp.sum(grad_pointwise)
         else:
+            # The final value of `grad` needs to be in the `numpy` namespace
+            # because the relevant `scipy.optimize` functions do not currently
+            # support the array API.
             grad = np.empty((n_classes, n_dof), dtype=weights.dtype, order="F")
             # grad_pointwise.shape = (n_samples, n_classes)
-            grad[:, :n_features] = grad_pointwise.T @ X + l2_reg_strength * weights
+            grad_X = grad_pointwise.T @ X
+            grad[:, :n_features] = (
+                move_to(grad_X, xp=np, device="cpu") + l2_reg_strength * weights
+            )
             if self.fit_intercept:
-                grad[:, -1] = grad_pointwise.sum(axis=0)
+                grad[:, -1] = move_to(
+                    xp.sum(grad_pointwise, axis=0), xp=np, device="cpu"
+                )
             if coef.ndim == 1:
                 grad = grad.ravel(order="F")
 
         return loss, grad
 
+    # Note: From here on, l1_reg_strength is unused. But we still want to ensure the
+    # same function signature across all related functions.
     def gradient(
         self,
         coef,
         X,
         y,
         sample_weight=None,
+        l1_reg_strength=0.0,
         l2_reg_strength=0.0,
         n_threads=1,
         raw_prediction=None,
@@ -331,6 +440,8 @@ class LinearModelLoss:
             Observed, true target values.
         sample_weight : None or contiguous array of shape (n_samples,), default=None
             Sample weights.
+        l1_reg_strength : float, default=0.0
+            Unused L1 regularization strength.
         l2_reg_strength : float, default=0.0
             L2 regularization strength
         n_threads : int, default=1
@@ -359,23 +470,30 @@ class LinearModelLoss:
             sample_weight=sample_weight,
             n_threads=n_threads,
         )
-        sw_sum = n_samples if sample_weight is None else np.sum(sample_weight)
+        xp, _, device = get_namespace_and_device(X, y, sample_weight)
+        sw_sum = n_samples if sample_weight is None else xp.sum(sample_weight)
         grad_pointwise /= sw_sum
 
         if not self.base_loss.is_multiclass:
-            grad = np.empty_like(coef, dtype=weights.dtype)
+            grad = xp.empty_like(coef, dtype=weights.dtype, device=device)
             grad[:n_features] = X.T @ grad_pointwise + l2_reg_strength * weights
             if self.fit_intercept:
-                grad[-1] = grad_pointwise.sum()
+                grad[-1] = xp.sum(grad_pointwise)
             return grad
         else:
-            grad = np.empty((n_classes, n_dof), dtype=weights.dtype, order="F")
+            if _is_numpy_namespace(xp):
+                grad = np.empty((n_classes, n_dof), dtype=weights.dtype, order="F")
+            else:
+                grad = xp.empty((n_classes, n_dof), dtype=weights.dtype, device=device)
             # gradient.shape = (n_samples, n_classes)
             grad[:, :n_features] = grad_pointwise.T @ X + l2_reg_strength * weights
             if self.fit_intercept:
-                grad[:, -1] = grad_pointwise.sum(axis=0)
+                grad[:, -1] = xp.sum(grad_pointwise, axis=0)
             if coef.ndim == 1:
-                return grad.ravel(order="F")
+                if _is_numpy_namespace(xp):
+                    return grad.ravel(order="F")
+                else:
+                    return _ravel(grad.T, xp=xp)
             else:
                 return grad
 
@@ -385,10 +503,13 @@ class LinearModelLoss:
         X,
         y,
         sample_weight=None,
+        l1_reg_strength=0.0,
         l2_reg_strength=0.0,
         n_threads=1,
         gradient_out=None,
         hessian_out=None,
+        grad_pointwise_out=None,
+        hess_pointwise_out=None,
         raw_prediction=None,
     ):
         """Computes gradient and hessian w.r.t. coef.
@@ -406,6 +527,8 @@ class LinearModelLoss:
             Observed, true target values.
         sample_weight : None or contiguous array of shape (n_samples,), default=None
             Sample weights.
+        l1_reg_strength : float, default=0.0
+            Unused L1 regularization strength.
         l2_reg_strength : float, default=0.0
             L2 regularization strength
         n_threads : int, default=1
@@ -413,9 +536,17 @@ class LinearModelLoss:
         gradient_out : None or ndarray of shape coef.shape
             A location into which the gradient is stored. If None, a new array
             might be created.
-        hessian_out : None or ndarray
+        hessian_out : None or ndarray of shape (n_dof, n_dof) or \
+            (n_classes * n_dof, n_classes * n_dof)
             A location into which the hessian is stored. If None, a new array
             might be created.
+        grad_pointwise_out : None or ndarray of shape (n_samples,) or
+            (n_samples, n_classes)
+            Array into which the pointwise gradients are written.
+        hess_pointwise_out : None or ndarray of shape (n_samples,) or
+            (n_samples, n_classes)
+            Array into which the pointwise hessians are written. For the multinomial
+            loss, it is not the hessians but the predicted probabilities.
         raw_prediction : C-contiguous array of shape (n_samples,) or array of \
             shape (n_samples, n_classes)
             Raw prediction values (in link space). If provided, these are used. If
@@ -426,79 +557,86 @@ class LinearModelLoss:
         gradient : ndarray of shape coef.shape
              The gradient of the loss.
 
-        hessian : ndarray
+        hessian : ndarray of shape (n_dof, n_dof) or \
+            (n_classes, n_dof, n_dof, n_classes)
             Hessian matrix.
 
         hessian_warning : bool
-            True if pointwise hessian has more than half of its elements non-positive.
+            True if pointwise hessian has more than 25% of its elements non-positive.
         """
-        n_samples, n_features = X.shape
+        (n_samples, n_features), n_classes = X.shape, self.base_loss.n_classes
         n_dof = n_features + int(self.fit_intercept)
-
         if raw_prediction is None:
             weights, intercept, raw_prediction = self.weight_intercept_raw(coef, X)
         else:
             weights, intercept = self.weight_intercept(coef)
-
-        grad_pointwise, hess_pointwise = self.base_loss.gradient_hessian(
-            y_true=y,
-            raw_prediction=raw_prediction,
-            sample_weight=sample_weight,
-            n_threads=n_threads,
-        )
         sw_sum = n_samples if sample_weight is None else np.sum(sample_weight)
-        grad_pointwise /= sw_sum
-        hess_pointwise /= sw_sum
 
-        # For non-canonical link functions and far away from the optimum, the pointwise
-        # hessian can be negative. We take care that 75% of the hessian entries are
-        # positive.
-        hessian_warning = np.mean(hess_pointwise <= 0) > 0.25
-        hess_pointwise = np.abs(hess_pointwise)
+        # Allocate gradient.
+        if gradient_out is None:
+            grad = np.empty_like(coef, dtype=weights.dtype, order="F")
+        elif gradient_out.shape != coef.shape:
+            raise ValueError(
+                f"gradient_out is required to have shape coef.shape = {coef.shape}; "
+                f"got {gradient_out.shape}."
+            )
+        elif self.base_loss.is_multiclass and not gradient_out.flags.f_contiguous:
+            raise ValueError("gradient_out must be F-contiguous.")
+        else:
+            grad = gradient_out
+        # Allocate hessian.
+        n = coef.size  # for multinomial this equals n_dof * n_classes
+        if hessian_out is None:
+            hess = np.empty((n, n), dtype=weights.dtype)
+        elif hessian_out.shape != (n, n):
+            raise ValueError(
+                f"hessian_out is required to have shape ({n, n}); got "
+                f"{hessian_out.shape=}."
+            )
+        elif self.base_loss.is_multiclass and (
+            not hessian_out.flags.c_contiguous and not hessian_out.flags.f_contiguous
+        ):
+            raise ValueError("hessian_out must be contiguous.")
+        else:
+            hess = hessian_out
 
         if not self.base_loss.is_multiclass:
-            # gradient
-            if gradient_out is None:
-                grad = np.empty_like(coef, dtype=weights.dtype)
-            else:
-                grad = gradient_out
+            grad_pointwise, hess_pointwise = self.base_loss.gradient_hessian(
+                y_true=y,
+                raw_prediction=raw_prediction,
+                sample_weight=sample_weight,
+                gradient_out=grad_pointwise_out,
+                hessian_out=hess_pointwise_out,
+                n_threads=n_threads,
+            )
+            grad_pointwise /= sw_sum
+            hess_pointwise /= sw_sum
+
+            # For non-canonical link functions and far away from the optimum, the
+            # pointwise hessian can be negative. We take care that 75% of the hessian
+            # entries are positive.
+            hessian_warning = (
+                np.average(hess_pointwise <= 0, weights=sample_weight) > 0.25
+            )
+            hess_pointwise = np.abs(hess_pointwise)
+
             grad[:n_features] = X.T @ grad_pointwise + l2_reg_strength * weights
             if self.fit_intercept:
                 grad[-1] = grad_pointwise.sum()
-
-            # hessian
-            if hessian_out is None:
-                hess = np.empty(shape=(n_dof, n_dof), dtype=weights.dtype)
-            else:
-                hess = hessian_out
 
             if hessian_warning:
                 # Exit early without computing the hessian.
                 return grad, hess, hessian_warning
 
-            # TODO: This "sandwich product", X' diag(W) X, is the main computational
-            # bottleneck for solvers. A dedicated Cython routine might improve it
-            # exploiting the symmetry (as opposed to, e.g., BLAS gemm).
-            if sparse.issparse(X):
-                hess[:n_features, :n_features] = (
-                    X.T
-                    @ sparse.dia_matrix(
-                        (hess_pointwise, 0), shape=(n_samples, n_samples)
-                    )
-                    @ X
-                ).toarray()
-            else:
-                # np.einsum may use less memory but the following, using BLAS matrix
-                # multiplication (gemm), is by far faster.
-                WX = hess_pointwise[:, None] * X
-                hess[:n_features, :n_features] = np.dot(X.T, WX)
+            hess[:n_features, :n_features] = sandwich_dot(X, hess_pointwise)
 
             if l2_reg_strength > 0:
                 # The L2 penalty enters the Hessian on the diagonal only. To add those
-                # terms, we use a flattened view on the array.
-                hess.reshape(-1)[
-                    : (n_features * n_dof) : (n_dof + 1)
-                ] += l2_reg_strength
+                # terms, we use a flattened view of the array.
+                order = "C" if hess.flags.c_contiguous else "F"
+                hess.reshape(-1, order=order)[: (n_features * n_dof) : (n_dof + 1)] += (
+                    l2_reg_strength
+                )
 
             if self.fit_intercept:
                 # With intercept included as added column to X, the hessian becomes
@@ -514,12 +652,133 @@ class LinearModelLoss:
         else:
             # Here we may safely assume HalfMultinomialLoss aka categorical
             # cross-entropy.
-            raise NotImplementedError
+            # HalfMultinomialLoss computes only the diagonal part of the hessian, i.e.
+            # diagonal in the classes. Here, we want the full hessian. Therefore, we
+            # call gradient_proba.
+            grad_pointwise, proba = self.base_loss.gradient_proba(
+                y_true=y,
+                raw_prediction=raw_prediction,
+                sample_weight=sample_weight,
+                gradient_out=grad_pointwise_out,
+                proba_out=hess_pointwise_out,
+                n_threads=n_threads,
+            )
+            grad_pointwise /= sw_sum
+            grad = grad.reshape((n_classes, n_dof), order="F")
+            grad[:, :n_features] = grad_pointwise.T @ X + l2_reg_strength * weights
+            if self.fit_intercept:
+                grad[:, -1] = grad_pointwise.sum(axis=0)
+            if coef.ndim == 1:
+                grad = grad.ravel(order="F")
+
+            # The full hessian matrix, i.e. not only the diagonal part, dropping most
+            # indices, is given by:
+            #
+            #   hess = X' @ h @ X
+            #
+            # Here, h is a priori a 4-dimensional matrix of shape
+            # (n_samples, n_samples, n_classes, n_classes). It is diagonal its first
+            # two dimensions (the ones with n_samples), i.e. it is
+            # effectively a 3-dimensional matrix (n_samples, n_classes, n_classes).
+            #
+            #   h = diag(p) - p' p
+            #
+            # or with indices k and l for classes
+            #
+            #   h_kl = p_k * delta_kl - p_k * p_l
+            #
+            # with p_k the (predicted) probability for class k. Only the dimension in
+            # n_samples multiplies with X.
+            # For 3 classes and n_samples = 1, this looks like ("@" is a bit misused
+            # here):
+            #
+            #   hess = X' @ (h00 h10 h20) @ X
+            #               (h10 h11 h12)
+            #               (h20 h12 h22)
+            #        = (X' @ diag(h00) @ X, X' @ diag(h10), X' @ diag(h20))
+            #          (X' @ diag(h10) @ X, X' @ diag(h11), X' @ diag(h12))
+            #          (X' @ diag(h20) @ X, X' @ diag(h12), X' @ diag(h22))
+            #
+            # Now coef of shape (n_classes * n_dof) is contiguous in n_classes.
+            # Therefore, we want the hessian to follow this convention, too, i.e.
+            #     hess[:n_classes, :n_classes] = (x0' @ h00 @ x0, x0' @ h10 @ x0, ..)
+            #                                    (x0' @ h10 @ x0, x0' @ h11 @ x0, ..)
+            #                                    (x0' @ h20 @ x0, x0' @ h12 @ x0, ..)
+            # is the first feature, x0, for all classes. In our implementation, we
+            # still want to take advantage of BLAS "X.T @ X". Therefore, we have some
+            # index/slicing battle to fight.
+            if sample_weight is not None:
+                sw = sample_weight / sw_sum
+            else:
+                sw = 1.0 / sw_sum
+
+            for k in range(n_classes):
+                # Diagonal terms (in classes) hess_kk.
+                # Note that this also writes to some of the lower triangular part.
+                h = proba[:, k] * (1 - proba[:, k]) * sw
+                hess[
+                    k : n_classes * n_features : n_classes,
+                    k : n_classes * n_features : n_classes,
+                ] = sandwich_dot(X, h)
+                if self.fit_intercept:
+                    # See above in the non multiclass case.
+                    Xh = X.T @ h
+                    hess[
+                        k : n_classes * n_features : n_classes,
+                        n_classes * n_features + k,
+                    ] = Xh
+                    hess[
+                        n_classes * n_features + k,
+                        k : n_classes * n_features : n_classes,
+                    ] = Xh
+                    hess[n_classes * n_features + k, n_classes * n_features + k] = (
+                        h.sum()
+                    )
+                # Off diagonal terms (in classes) hess_kl.
+                for l in range(k + 1, n_classes):
+                    # Upper triangle (in classes).
+                    h = -proba[:, k] * proba[:, l] * sw
+                    hess[
+                        k : n_classes * n_features : n_classes,
+                        l : n_classes * n_features : n_classes,
+                    ] = sandwich_dot(X, h)
+                    if self.fit_intercept:
+                        Xh = X.T @ h
+                        hess[
+                            k : n_classes * n_features : n_classes,
+                            n_classes * n_features + l,
+                        ] = Xh
+                        hess[
+                            n_classes * n_features + k,
+                            l : n_classes * n_features : n_classes,
+                        ] = Xh
+                        hess[n_classes * n_features + k, n_classes * n_features + l] = (
+                            h.sum()
+                        )
+                    # Fill lower triangle (in classes).
+                    hess[l::n_classes, k::n_classes] = hess[k::n_classes, l::n_classes]
+
+            if l2_reg_strength > 0:
+                # See above in the non multiclass case.
+                order = "C" if hess.flags.c_contiguous else "F"
+                hess.reshape(-1, order=order)[
+                    : (n_classes**2 * n_features * n_dof) : (n_classes * n_dof + 1)
+                ] += l2_reg_strength
+
+            # The pointwise hessian is always non-negative for the multinomial loss.
+            hessian_warning = False
 
         return grad, hess, hessian_warning
 
     def gradient_hessian_product(
-        self, coef, X, y, sample_weight=None, l2_reg_strength=0.0, n_threads=1
+        self,
+        coef,
+        X,
+        y,
+        sample_weight=None,
+        l1_reg_strength=0.0,
+        l2_reg_strength=0.0,
+        n_threads=1,
     ):
         """Computes gradient and hessp (hessian product function) w.r.t. coef.
 
@@ -536,6 +795,8 @@ class LinearModelLoss:
             Observed, true target values.
         sample_weight : None or contiguous array of shape (n_samples,), default=None
             Sample weights.
+        l1_reg_strength : float, default=0.0
+            Unused L1 regularization strength.
         l2_reg_strength : float, default=0.0
             L2 regularization strength
         n_threads : int, default=1
@@ -553,7 +814,9 @@ class LinearModelLoss:
         (n_samples, n_features), n_classes = X.shape, self.base_loss.n_classes
         n_dof = n_features + int(self.fit_intercept)
         weights, intercept, raw_prediction = self.weight_intercept_raw(coef, X)
-        sw_sum = n_samples if sample_weight is None else np.sum(sample_weight)
+        xp, _, device = get_namespace_and_device(X, y, sample_weight)
+        is_numpy_ns = _is_numpy_namespace(xp)
+        sw_sum = n_samples if sample_weight is None else xp.sum(sample_weight)
 
         if not self.base_loss.is_multiclass:
             grad_pointwise, hess_pointwise = self.base_loss.gradient_hessian(
@@ -564,27 +827,28 @@ class LinearModelLoss:
             )
             grad_pointwise /= sw_sum
             hess_pointwise /= sw_sum
-            grad = np.empty_like(coef, dtype=weights.dtype)
+            grad = xp.empty_like(coef, dtype=weights.dtype)
             grad[:n_features] = X.T @ grad_pointwise + l2_reg_strength * weights
             if self.fit_intercept:
-                grad[-1] = grad_pointwise.sum()
+                grad[-1] = xp.sum(grad_pointwise)
 
             # Precompute as much as possible: hX, hX_sum and hessian_sum
-            hessian_sum = hess_pointwise.sum()
+            hessian_sum = xp.sum(hess_pointwise)
             if sparse.issparse(X):
                 hX = (
-                    sparse.dia_matrix((hess_pointwise, 0), shape=(n_samples, n_samples))
+                    sparse.dia_array((hess_pointwise, 0), shape=(n_samples, n_samples))
                     @ X
                 )
             else:
-                hX = hess_pointwise[:, np.newaxis] * X
+                hX = hess_pointwise[:, None] * X
 
             if self.fit_intercept:
-                # Calculate the double derivative with respect to intercept.
-                # Note: In case hX is sparse, hX.sum is a matrix object.
-                hX_sum = np.squeeze(np.asarray(hX.sum(axis=0)))
-                # prevent squeezing to zero-dim array if n_features == 1
-                hX_sum = np.atleast_1d(hX_sum)
+                # Calculate the double derivative with respect to the intercept.
+                if sparse.issparse(X):
+                    # Note: In case hX is sparse, hX.sum is a matrix object.
+                    hX_sum = xp.asarray(hX.sum(axis=0))
+                else:
+                    hX_sum = xp.sum(hX, axis=0)
 
             # With intercept included and l2_reg_strength = 0, hessp returns
             # res = (X, 1)' @ diag(h) @ (X, 1) @ s
@@ -592,11 +856,16 @@ class LinearModelLoss:
             # res[:n_features] = X' @ hX @ s[:n_features] + sum(h) * s[-1]
             # res[-1] = 1' @ hX @ s[:n_features] + sum(h) * s[-1]
             def hessp(s):
-                ret = np.empty_like(s)
+                ret = xp.empty_like(s)
                 if sparse.issparse(X):
                     ret[:n_features] = X.T @ (hX @ s[:n_features])
                 else:
-                    ret[:n_features] = np.linalg.multi_dot([X.T, hX, s[:n_features]])
+                    if is_numpy_ns:
+                        ret[:n_features] = np.linalg.multi_dot(
+                            [X.T, hX, s[:n_features]]
+                        )
+                    else:
+                        ret[:n_features] = X.T @ (hX @ s[:n_features])
                 ret[:n_features] += l2_reg_strength * s[:n_features]
 
                 if self.fit_intercept:
@@ -617,10 +886,13 @@ class LinearModelLoss:
                 n_threads=n_threads,
             )
             grad_pointwise /= sw_sum
-            grad = np.empty((n_classes, n_dof), dtype=weights.dtype, order="F")
+            if is_numpy_ns:
+                grad = np.empty((n_classes, n_dof), dtype=weights.dtype, order="F")
+            else:
+                grad = xp.empty((n_classes, n_dof), dtype=weights.dtype, device=device)
             grad[:, :n_features] = grad_pointwise.T @ X + l2_reg_strength * weights
             if self.fit_intercept:
-                grad[:, -1] = grad_pointwise.sum(axis=0)
+                grad[:, -1] = xp.sum(grad_pointwise, axis=0)
 
             # Full hessian-vector product, i.e. not only the diagonal part of the
             # hessian. Derivation with some index battle for input vector s:
@@ -642,31 +914,49 @@ class LinearModelLoss:
             #   = sum_{i, m} (X')_{ji} * p_i_k
             #                * (X_{im} * s_k_m - sum_l p_i_l * X_{im} * s_l_m)
             #
-            # See also https://github.com/scikit-learn/scikit-learn/pull/3646#discussion_r17461411  # noqa
+            # See also https://github.com/scikit-learn/scikit-learn/pull/3646#discussion_r17461411
             def hessp(s):
-                s = s.reshape((n_classes, -1), order="F")  # shape = (n_classes, n_dof)
+                if is_numpy_ns:
+                    s = s.reshape(
+                        (n_classes, -1), order="F"
+                    )  # shape = (n_classes, n_dof)
+                else:
+                    s = xp.reshape(s, (-1, n_classes)).T
                 if self.fit_intercept:
                     s_intercept = s[:, -1]
                     s = s[:, :-1]  # shape = (n_classes, n_features)
                 else:
                     s_intercept = 0
                 tmp = X @ s.T + s_intercept  # X_{im} * s_k_m
-                tmp += (-proba * tmp).sum(axis=1)[:, np.newaxis]  # - sum_l ..
+                tmp -= xp.sum(proba * tmp, axis=1)[:, None]  # - sum_l ..
                 tmp *= proba  # * p_i_k
                 if sample_weight is not None:
-                    tmp *= sample_weight[:, np.newaxis]
+                    tmp *= sample_weight[:, None]
                 # hess_prod = empty_like(grad), but we ravel grad below and this
                 # function is run after that.
-                hess_prod = np.empty((n_classes, n_dof), dtype=weights.dtype, order="F")
+                if is_numpy_ns:
+                    hess_prod = np.empty(
+                        (n_classes, n_dof), dtype=weights.dtype, order="F"
+                    )
+                else:
+                    hess_prod = xp.empty(
+                        (n_classes, n_dof), dtype=weights.dtype, device=device
+                    )
                 hess_prod[:, :n_features] = (tmp.T @ X) / sw_sum + l2_reg_strength * s
                 if self.fit_intercept:
-                    hess_prod[:, -1] = tmp.sum(axis=0) / sw_sum
+                    hess_prod[:, -1] = xp.sum(tmp, axis=0) / sw_sum
                 if coef.ndim == 1:
-                    return hess_prod.ravel(order="F")
+                    if is_numpy_ns:
+                        return hess_prod.ravel(order="F")
+                    else:
+                        return _ravel(hess_prod.T, xp=xp)
                 else:
                     return hess_prod
 
             if coef.ndim == 1:
-                return grad.ravel(order="F"), hessp
+                if is_numpy_ns:
+                    return grad.ravel(order="F"), hessp
+                else:
+                    return _ravel(grad.T, xp=xp), hessp
 
         return grad, hessp

@@ -28,10 +28,8 @@ set.
 
 """
 
-# Code source: Tom Dupré la Tour
-# Adapted from plot_classifier_comparison by Gaël Varoquaux and Andreas Müller
-#
-# License: BSD 3 clause
+# Authors: The scikit-learn developers
+# SPDX-License-Identifier: BSD-3-Clause
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -64,7 +62,7 @@ def get_name(estimator):
 # should be used.
 classifiers = [
     (
-        make_pipeline(StandardScaler(), LogisticRegression(random_state=0)),
+        make_pipeline(StandardScaler(), LogisticRegression()),
         {"logisticregression__C": np.logspace(-1, 1, 3)},
     ),
     (
@@ -74,8 +72,10 @@ classifiers = [
     (
         make_pipeline(
             StandardScaler(),
-            KBinsDiscretizer(encode="onehot", random_state=0),
-            LogisticRegression(random_state=0),
+            KBinsDiscretizer(
+                encode="onehot", quantile_method="averaged_inverted_cdf", random_state=0
+            ),
+            LogisticRegression(),
         ),
         {
             "kbinsdiscretizer__n_bins": np.arange(5, 8),
@@ -85,7 +85,9 @@ classifiers = [
     (
         make_pipeline(
             StandardScaler(),
-            KBinsDiscretizer(encode="onehot", random_state=0),
+            KBinsDiscretizer(
+                encode="onehot", quantile_method="averaged_inverted_cdf", random_state=0
+            ),
             LinearSVC(random_state=0),
         ),
         {

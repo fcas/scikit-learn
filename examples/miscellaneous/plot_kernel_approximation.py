@@ -34,9 +34,8 @@ This is not easily possible for the case of the kernelized SVM.
 # ---------------------------------------------------
 
 
-# Author: Gael Varoquaux <gael dot varoquaux at normalesup dot org>
-#         Andreas Mueller <amueller@ais.uni-bonn.de>
-# License: BSD 3 clause
+# Authors: The scikit-learn developers
+# SPDX-License-Identifier: BSD-3-Clause
 
 # Standard scientific Python imports
 from time import time
@@ -56,7 +55,7 @@ digits = datasets.load_digits(n_class=9)
 # %%
 # Timing and accuracy plots
 # --------------------------------------------------
-# To apply an classifier on this data, we need to flatten the image, to
+# To apply a classifier on this data, we need to flatten the image, to
 # turn the data in a (samples, feature) matrix:
 n_samples = len(digits.data)
 data = digits.data / 16.0

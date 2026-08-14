@@ -4,17 +4,19 @@
 channels:
   - conda-forge
 dependencies:
-  - python=3.9
+  - python=3.14
   - numpy
   - blas
   - scipy
-  - cython
+  - cython!=3.2.6,!=3.2.7,!=3.2.8,!=3.2.9
   - joblib
+  - narwhals
   - threadpoolctl
   - matplotlib
   - pandas
+  - rich
   - pyamg
-  - pytest<8
+  - pytest
   - pytest-xdist
   - pillow
   - pip
@@ -33,7 +35,9 @@ dependencies:
   - polars
   - pooch
   - sphinxext-opengraph
-  - pip
-  - pip:
-    - jupyterlite-sphinx
-    - jupyterlite-pyodide-kernel
+  - sphinx-remove-toctrees
+  - sphinx-design
+  - pydata-sphinx-theme
+  - towncrier
+  - jupyterlite-sphinx
+  - jupyterlite-pyodide-kernel
